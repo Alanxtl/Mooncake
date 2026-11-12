@@ -128,7 +128,10 @@ bool ValidateIdentity(const SnapshotMetadata& metadata, std::string* reason) {
     const bool with_weights =
         metadata.schema_version == kBatchOpLogWeightSnapshotSchemaVersion &&
         metadata.snapshot_format == kBatchOpLogWeightSnapshotFormat;
-    if (!legacy && !with_weights) {
+    const bool with_move_buffers =
+        metadata.schema_version == kBatchOpLogMoveBufferSnapshotSchemaVersion &&
+        metadata.snapshot_format == kBatchOpLogMoveBufferSnapshotFormat;
+    if (!legacy && !with_weights && !with_move_buffers) {
         SetReason(reason, "unsupported snapshot version and format");
         return false;
     }
@@ -342,7 +345,9 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
     if (!DecodeObjectDescriptor(root["segments"], decoded.segments, &reason)) {
         return tl::make_unexpected(std::move(reason));
     }
-    if (decoded.schema_version == kBatchOpLogWeightSnapshotSchemaVersion) {
+    if (decoded.schema_version == kBatchOpLogWeightSnapshotSchemaVersion ||
+        (decoded.schema_version == kBatchOpLogMoveBufferSnapshotSchemaVersion &&
+         root.isMember("weight_metadata"))) {
         BatchOpLogSnapshotObjectDescriptor weights;
         if (!root.isMember("weight_metadata") ||
             !DecodeObjectDescriptor(root["weight_metadata"], weights,

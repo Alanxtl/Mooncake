@@ -29,10 +29,17 @@ struct ObjectState {
     // A promotion a transient gate turned away, waiting for a retry. It is
     // not work in flight: no task holds anything for it.
     HeapOptional<PromotionCandidate> promotion_candidate;
+    // A previous leader had already handed the source address to a mover.
+    std::chrono::steady_clock::time_point move_recovery_until{};
+
+    bool IsRecoveringMove() const {
+        return move_recovery_until != std::chrono::steady_clock::time_point{} &&
+               std::chrono::steady_clock::now() < move_recovery_until;
+    }
 
     bool HasWorkInFlight() const {
         return is_processing || replication_task || offloading_task ||
-               promotion_task;
+               promotion_task || IsRecoveringMove();
     }
 };
 

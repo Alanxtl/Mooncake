@@ -170,8 +170,9 @@ YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
 struct MoveStartResponse {
     Replica::Descriptor source;
     std::optional<Replica::Descriptor> target;
+    struct_pack::compatible<UUID, 1> drain_move_token;
 };
-YLT_REFL(MoveStartResponse, source, target);
+YLT_REFL(MoveStartResponse, source, target, drain_move_token);
 
 enum class JobType {
     DRAIN = 0,

@@ -18,6 +18,21 @@ inline std::string NormalizeTenantId(std::string_view tenant_id) {
     return TenantId(std::string(tenant_id)).value();
 }
 
+struct MoveBufferReservation {
+    ReplicaID replica_id{0};
+    UUID segment_id{};
+    AllocatedBuffer::Descriptor buffer;
+    // A successor waits this long after taking over before releasing it.
+    uint64_t recovery_hold_ms{0};
+    ReplicaID copying_from{0};
+    UUID copying_from_segment{};
+    std::string copying_from_endpoint;
+
+    YLT_REFL(MoveBufferReservation, replica_id, segment_id, buffer,
+             recovery_hold_ms, copying_from, copying_from_segment,
+             copying_from_endpoint);
+};
+
 /**
  * @brief Metadata structure for Standby to store and restore object information
  *
@@ -42,12 +57,18 @@ struct StandbyObjectMetadata {
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
     struct_pack::compatible<std::string, 4> residency_affinity_id;
+    struct_pack::compatible<std::vector<MoveBufferReservation>, 5> move_buffers;
 
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
              data_type, hard_pinned, session_id, object_checksum,
-             residency_affinity_id);
+             residency_affinity_id, move_buffers);
+
+    bool IsMoveBufferOnly() const {
+        return size == 0 && replicas.empty() && move_buffers &&
+               !move_buffers->empty();
+    }
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -134,6 +155,16 @@ struct MetadataPayload {
     }
 };
 
+// Cutover replaces the live publication and exchanges the temporary target
+// reservation for the source reservation in one log entry.
+struct MoveBuffersOp {
+    std::optional<MetadataPayload> publication;
+    std::optional<MoveBufferReservation> reserve;
+    ReplicaID release{0};
+
+    YLT_REFL(MoveBuffersOp, publication, reserve, release);
+};
+
 /**
  * Thread-safe registry of segments known to standby.
  * Maintained by applying SEGMENT_MOUNT/UNMOUNT/UPDATE OpLog events.
@@ -170,6 +201,11 @@ class StandbySegmentRegistry {
 class MetadataStore {
    public:
     virtual ~MetadataStore() = default;
+
+    virtual bool ApplyMoveBuffers(const std::string&, const std::string&,
+                                  const MoveBuffersOp&) {
+        return false;
+    }
 
     // NEW: tenant-aware methods (primary API)
     virtual bool PutMetadata(const std::string& tenant_id,

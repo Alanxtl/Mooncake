@@ -36,6 +36,9 @@ class WrappedMasterService {
     // instance that is destroyed rather than reused if publication fails.
     void MarkReadyForServing();
     void ActivateServing();
+    void SetReadViewCheck(std::function<bool()> check) {
+        master_service_.SetReadViewCheck(std::move(check));
+    }
     MasterService::RestoreLifecycleState GetRestoreLifecycleState() const;
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
@@ -413,6 +416,11 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const std::string& tenant_id);
+    tl::expected<void, ErrorCode> FinishDrainMove(const UUID& client_id,
+                                                  const std::string& key,
+                                                  const std::string& tenant_id,
+                                                  const UUID& token,
+                                                  bool commit);
 
     tl::expected<void, ErrorCode> EvictDiskReplica(const UUID& client_id,
                                                    const std::string& key,

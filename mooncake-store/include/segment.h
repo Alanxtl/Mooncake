@@ -175,6 +175,8 @@ class ScopedSegmentAccess {
      * is missing or has no allocated memory.
      */
     bool HasAllocatedMemory(const std::string& segment_name) const;
+    std::optional<UUID> GetSegmentIdByName(
+        const std::string& segment_name) const;
 
     /**
      * @brief Get all segments that are not ready (not in OK status)

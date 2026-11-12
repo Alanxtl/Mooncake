@@ -1,5 +1,6 @@
 #include "ha/snapshot/batch_oplog/writer.h"
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -160,6 +161,13 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         }
 
         const size_t object_count = objects.size();
+        if (std::ranges::any_of(objects, [](const StandbyObjectEntry& entry) {
+                return entry.metadata.move_buffers.has_value();
+            })) {
+            manifest.schema_version =
+                ha::kBatchOpLogMoveBufferSnapshotSchemaVersion;
+            manifest.snapshot_format = ha::kBatchOpLogMoveBufferSnapshotFormat;
+        }
         auto encoded = EncodeBatchOpLogSnapshotObjectChunk(chunk_index,
                                                            std::move(objects));
         const std::string key = ha::BuildBatchOpLogSnapshotObjectChunkKey(

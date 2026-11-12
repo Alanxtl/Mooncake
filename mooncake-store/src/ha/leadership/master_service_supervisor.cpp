@@ -745,9 +745,29 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // Keep the gate alive until after the service is destroyed because the
         // OpLog writer owned by the service invokes a callback that uses it.
         detail::ServingStateGate serving_state;
+        std::atomic<std::chrono::steady_clock::time_point> checked_view_until{};
+        std::mutex check_view_mutex;
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
+        if (config.enable_oplog && HaBackendSupportsOpLog(spec.type)) {
+            const auto version = leadership_session->view.view_version;
+            wrapped_master_service->SetReadViewCheck([&, version] {
+                using Clock = std::chrono::steady_clock;
+                if (Clock::now() < checked_view_until.load()) return true;
+                std::lock_guard lock(check_view_mutex);
+                const auto start = Clock::now();
+                if (start < checked_view_until.load()) return true;
+                const auto current = leader_coordinator.ReadCurrentView();
+                if (!current || !*current ||
+                    (*current)->view_version != version) {
+                    return false;
+                }
+                const auto deadline = start + kReadViewCacheTtl;
+                checked_view_until.store(deadline);
+                return Clock::now() < deadline;
+            });
+        }
         // Runs the term's handlers once they are registered. It drains before
         // the service goes, so release the service through release_service.
         std::unique_ptr<RpcWorkerPool> worker_pool;

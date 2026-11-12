@@ -55,6 +55,8 @@ class StandbyMetadataStore final : public MetadataStore {
                      const StandbyObjectMetadata& metadata) override;
     bool RestoreMetadata(const std::string& tenant_id, const std::string& key,
                          const StandbyObjectMetadata& metadata);
+    bool ApplyMoveBuffers(const std::string& tenant_id, const std::string& key,
+                          const MoveBuffersOp& op) override;
     bool Put(const std::string& key,
              const std::string& payload = std::string()) override;
     std::optional<StandbyObjectMetadata> GetMetadata(

@@ -333,6 +333,11 @@ struct RpcNameTraits<&WrappedMasterService::MoveRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::FinishDrainMove> {
+    static constexpr const char* value = "FinishDrainMove";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CreateCopyTask> {
     static constexpr const char* value = "CreateCopyTask";
 };
@@ -1538,6 +1543,13 @@ tl::expected<void, ErrorCode> MasterClient::MoveRevoke(
         client_id_, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::FinishDrainMove(
+    const std::string& key, const std::string& tenant_id, const UUID& token,
+    bool commit) {
+    return invoke_rpc<&WrappedMasterService::FinishDrainMove, void>(
+        client_id_, key, tenant_id, token, commit);
 }
 
 tl::expected<void, ErrorCode> MasterClient::MarkTaskToComplete(

@@ -18,6 +18,9 @@ inline constexpr char kBatchOpLogSnapshotFormat[] =
 inline constexpr uint32_t kBatchOpLogWeightSnapshotSchemaVersion = 2;
 inline constexpr char kBatchOpLogWeightSnapshotFormat[] =
     "standby-oplog-materialized/v2";
+inline constexpr uint32_t kBatchOpLogMoveBufferSnapshotSchemaVersion = 3;
+inline constexpr char kBatchOpLogMoveBufferSnapshotFormat[] =
+    "standby-oplog-materialized/v3";
 
 struct BatchOpLogSnapshotDescriptor {
     uint32_t schema_version{kBatchOpLogSnapshotSchemaVersion};

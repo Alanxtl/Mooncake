@@ -34,6 +34,7 @@
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
+#include "ha/snapshot/batch_oplog/codec.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -5911,6 +5912,182 @@ TEST_F(MasterServiceHATest, CopyEndVisibleBeforeBatchRecordDurable) {
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(key, batch.entries[0].object_key);
+}
+
+TEST_F(MasterServiceHATest,
+       HotDrainPromotionDuringCopyKeepsSourceAndReservesTarget) {
+    constexpr size_t bytes = 1024;
+    const auto source =
+        MakeSegment("prepared_source", kDefaultSegmentBase, bytes);
+    const auto target = MakeSegment(
+        "prepared_target", kDefaultSegmentBase + kDefaultSegmentSize, bytes);
+    const auto source_owner = generate_uuid();
+    const auto target_owner = generate_uuid();
+    auto object = MakeStandbyObject("prepared_move", source.name, bytes);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = source.base;
+    const auto source_id = object.metadata.replicas.front().id;
+    const auto target_id = source_id + 1;
+    object.metadata.move_buffers = std::vector<MoveBufferReservation>{
+        {target_id,
+         target.id,
+         {bytes, target.base, target.protocol, target.te_endpoint},
+         20000,
+         source_id,
+         source.id,
+         source.te_endpoint}};
+
+    MasterService successor(
+        MasterServiceConfig::builder().set_enable_ha(true).build());
+    ASSERT_TRUE(successor.RestoreFromStandbySnapshot(
+        {object}, 0,
+        {MakeStandbyMemorySegment(source.name, bytes),
+         MakeStandbyMemorySegment(target.name, bytes)}));
+    ASSERT_TRUE(successor.ReMountSegment({source}, source_owner));
+    ASSERT_TRUE(successor.ReMountSegment({target}, target_owner));
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(successor, target.name), bytes);
+    auto read = successor.GetReplicaList(object.key, kDefaultTenant);
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->replicas.size(), 1u);
+    EXPECT_EQ(read->replicas.front().id, source_id);
+    auto removed = successor.Remove(object.key, kDefaultTenant, /*force=*/true);
+    ASSERT_FALSE(removed);
+    EXPECT_EQ(removed.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    auto old_commit = successor.MoveEnd(source_owner, object.key,
+                                        kDefaultTenant, generate_uuid());
+    EXPECT_FALSE(old_commit);
+}
+
+TEST_F(MasterServiceHATest,
+       HotDrainKeepsSourceAllocationAcrossPromotionAndRemount) {
+    constexpr size_t bytes = 1024;
+    const std::string cluster_id = "hot_drain_promotion";
+    const std::string key = "hot_key";
+    const auto source = MakeSegment("hot_src", kDefaultSegmentBase, bytes);
+    const auto target = MakeSegment(
+        "hot_dst", kDefaultSegmentBase + kDefaultSegmentSize, bytes);
+    const UUID source_owner = generate_uuid();
+    const UUID target_owner = generate_uuid();
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    const auto config = MasterServiceConfig::builder()
+                            .set_enable_ha(true)
+                            .set_enable_oplog(true)
+                            .set_cluster_id(cluster_id)
+                            .set_default_kv_lease_ttl(2000)
+                            .set_oplog_batch_max_entries(1)
+                            .set_eviction_high_watermark_ratio(1.0)
+                            .build();
+    OpLogBatchStorage storage(cluster_id, *backend);
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    const auto replay = [&](uint64_t first, uint64_t last) {
+        for (auto id = first; id <= last; ++id) {
+            OpLogBatchRecord batch;
+            ReadBatchEventually(storage, id, batch);
+            ASSERT_EQ(batch.entries.size(), 1u);
+            ASSERT_TRUE(applier.ApplyOpLogEntry(batch.entries.front()));
+        }
+    };
+
+    ReplicaID target_id = 0;
+    {
+        MasterService leader(config);
+        ASSERT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(leader).SetBatchOpLogBackendForTesting(
+                      backend));
+        ASSERT_TRUE(leader.MountSegment(source, source_owner));
+        ASSERT_TRUE(leader.MountSegment(target, target_owner));
+        PutObjectOnSegment(leader, source_owner, key, source.name, bytes);
+        ASSERT_TRUE(leader.GetReplicaList(key, kDefaultTenant));
+        CreateDrainJobRequest request;
+        request.segments = {source.name};
+        request.target_segments = {target.name};
+        request.max_concurrency = 1;
+        ASSERT_TRUE(leader.CreateDrainJob(request));
+        bool scheduled = false;
+        for (int attempt = 0; attempt < 100 && !scheduled; ++attempt) {
+            auto tasks = leader.FetchTasks(source_owner, 1);
+            ASSERT_TRUE(tasks);
+            scheduled = !tasks->empty();
+            if (!scheduled) {
+                ASSERT_TRUE(leader.GetReplicaList(key, kDefaultTenant));
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        ASSERT_TRUE(scheduled);
+        auto move = leader.MoveStart(source_owner, key, kDefaultTenant,
+                                     source.name, target.name);
+        ASSERT_TRUE(move);
+        ASSERT_TRUE(move->target);
+        ASSERT_TRUE(move->drain_move_token);
+        target_id = move->target->id;
+        ASSERT_NO_FATAL_FAILURE(replay(1, 4));
+        auto before = standby.GetMetadata(key);
+        ASSERT_TRUE(before && before->move_buffers);
+        ASSERT_EQ(before->replicas.size(), 1u);
+        EXPECT_EQ(before->replicas.front().id, move->source.id);
+        ASSERT_EQ(before->move_buffers->size(), 1u);
+        EXPECT_EQ(before->move_buffers->front().replica_id, target_id);
+        EXPECT_FALSE(
+            leader.MoveEnd(source_owner, key, kDefaultTenant, generate_uuid()));
+        ASSERT_TRUE(leader.GetReplicaList(key, kDefaultTenant));
+        ASSERT_TRUE(leader.MoveEnd(source_owner, key, kDefaultTenant,
+                                   *move->drain_move_token));
+        ASSERT_NO_FATAL_FAILURE(replay(5, 5));
+        auto after = standby.GetMetadata(key);
+        ASSERT_TRUE(after && after->move_buffers);
+        ASSERT_EQ(after->replicas.size(), 1u);
+        EXPECT_EQ(after->replicas.front().id, target_id);
+        ASSERT_EQ(after->move_buffers->size(), 1u);
+        EXPECT_EQ(after->move_buffers->front().replica_id, move->source.id);
+        leader.StopBatchOpLogWriter();
+    }
+
+    // Promote from the same snapshot representation used by the standby.
+    std::vector<StandbyObjectEntry> snapshot;
+    standby.Snapshot(snapshot);
+    auto encoded = EncodeBatchOpLogSnapshotObjectChunk(0, std::move(snapshot));
+    auto decoded = DecodeBatchOpLogSnapshotObjectChunk(encoded, 0, 1);
+    ASSERT_TRUE(decoded);
+    StandbyMetadataStore recovered;
+    const auto& entry = decoded->objects.front();
+    ASSERT_TRUE(
+        recovered.RestoreMetadata(entry.tenant_id, entry.key, entry.metadata));
+    ReplicaID max_replica_id = 0;
+    ASSERT_TRUE(recovered.ValidateReplicaIds(max_replica_id));
+    DurablePrefix prefix;
+    ASSERT_EQ(storage.ReadDurablePrefix(prefix), ErrorCode::OK);
+    MasterService successor(config);
+    ASSERT_EQ(ErrorCode::OK,
+              MasterServiceTestPeer(successor).SetBatchOpLogBackendForTesting(
+                  backend));
+    ASSERT_TRUE(successor.RestoreFromBatchOpLogPromotion(
+        recovered, prefix, applier.GetSegmentRegistry().GetAllSegments(),
+        max_replica_id));
+    EXPECT_FALSE(successor.MountSegment(source, source_owner));
+    ASSERT_TRUE(successor.ReMountSegment({source}, source_owner));
+    ASSERT_TRUE(successor.ReMountSegment({target}, target_owner));
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(successor, source.name), bytes);
+    EXPECT_FALSE(successor.UnmountSegment(source.id, source_owner));
+    ReplicateConfig placement;
+    placement.replica_num = 1;
+    placement.preferred_segments = {source.name};
+    EXPECT_FALSE(successor.PutStart(source_owner, "early_reuse", kDefaultTenant,
+                                    bytes, placement));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (SegmentAllocatedSizeForTesting(successor, source.name) != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        auto read = successor.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(read);
+        ASSERT_EQ(read->replicas.size(), 1u);
+        EXPECT_EQ(read->replicas.front().id, target_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(successor, source.name), 0u);
+    EXPECT_TRUE(successor.PutStart(source_owner, "reused", kDefaultTenant,
+                                   bytes, placement));
 }
 
 TEST_F(MasterServiceHATest,

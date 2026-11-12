@@ -4748,13 +4748,25 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     }
 
     const auto& response = move_start_result.value();
+    const auto end = [&] {
+        return response.drain_move_token
+                   ? master_client_.FinishDrainMove(
+                         key, tenant_id, *response.drain_move_token, true)
+                   : master_client_.MoveEnd(key, tenant_id);
+    };
+    const auto revoke = [&] {
+        return response.drain_move_token
+                   ? master_client_.FinishDrainMove(
+                         key, tenant_id, *response.drain_move_token, false)
+                   : master_client_.MoveRevoke(key, tenant_id);
+    };
     if (!response.target.has_value()) {
         LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
                   << ", info=target_replica_already_exists";
         // Target already exists, consider it success
-        auto move_end_result = master_client_.MoveEnd(key, tenant_id);
+        auto move_end_result = end();
         if (!move_end_result.has_value()) {
-            (void)master_client_.MoveRevoke(key, tenant_id);
+            (void)revoke();
             ErrorCode error = move_end_result.error();
             LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
                        << ", error=move_end_failed" << ", error_code=" << error;
@@ -4765,10 +4777,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
 
     std::vector<Replica::Descriptor> targets = {response.target.value()};
 
-    auto result = ExecuteReplicaTransfer(
-        key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
-        [&]() { return master_client_.MoveRevoke(key, tenant_id); },
-        response.source, targets);
+    auto result = ExecuteReplicaTransfer(key, "move", end, revoke,
+                                         response.source, targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key

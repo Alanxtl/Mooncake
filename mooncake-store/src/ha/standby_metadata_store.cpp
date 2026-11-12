@@ -10,7 +10,55 @@ bool StandbyMetadataStore::PutMetadata(const std::string& tenant_id,
                                        const std::string& key,
                                        const StandbyObjectMetadata& metadata) {
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[NormalizeTenantId(tenant_id)][key] = metadata;
+    auto& entry = store_[NormalizeTenantId(tenant_id)][key];
+    auto reservations = std::move(entry.move_buffers);
+    entry = metadata;
+    entry.move_buffers = std::move(reservations);
+    return true;
+}
+
+bool StandbyMetadataStore::ApplyMoveBuffers(const std::string& tenant_id,
+                                            const std::string& key,
+                                            const MoveBuffersOp& op) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto tenant = store_.find(NormalizeTenantId(tenant_id));
+    if (tenant == store_.end()) return false;
+    auto entry = tenant->second.find(key);
+    if (entry == tenant->second.end()) return false;
+
+    auto& metadata = entry->second;
+    auto reservations =
+        metadata.move_buffers.value_or(std::vector<MoveBufferReservation>{});
+    if (op.release != 0) {
+        if (std::erase_if(reservations, [&](const auto& buffer) {
+                return buffer.replica_id == op.release;
+            }) != 1) {
+            return false;
+        }
+    }
+    if (op.reserve) {
+        const auto& buffer = *op.reserve;
+        if (buffer.replica_id == 0 || buffer.segment_id == UUID{} ||
+            buffer.buffer.size_ == 0 ||
+            buffer.buffer.transport_endpoint_.empty() ||
+            std::ranges::any_of(reservations, [&](const auto& reserved) {
+                return reserved.replica_id == buffer.replica_id;
+            })) {
+            return false;
+        }
+        reservations.push_back(buffer);
+    }
+    if (op.publication) metadata = op.publication->ToStandbyMetadata();
+    if (reservations.empty()) {
+        if (metadata.IsMoveBufferOnly()) {
+            tenant->second.erase(entry);
+            if (tenant->second.empty()) store_.erase(tenant);
+        } else {
+            metadata.move_buffers.reset();
+        }
+    } else {
+        metadata.move_buffers = std::move(reservations);
+    }
     return true;
 }
 
@@ -35,7 +83,7 @@ std::optional<StandbyObjectMetadata> StandbyMetadataStore::GetMetadata(
         return std::nullopt;
     }
     auto object = tenant->second.find(key);
-    return object == tenant->second.end()
+    return object == tenant->second.end() || object->second.IsMoveBufferOnly()
                ? std::nullopt
                : std::optional<StandbyObjectMetadata>(object->second);
 }
@@ -44,9 +92,18 @@ bool StandbyMetadataStore::Remove(const std::string& tenant_id,
                                   const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto tenant = store_.find(NormalizeTenantId(tenant_id));
-    if (tenant == store_.end() || tenant->second.erase(key) == 0) {
+    if (tenant == store_.end()) return false;
+    auto object = tenant->second.find(key);
+    if (object == tenant->second.end() || object->second.IsMoveBufferOnly()) {
         return false;
     }
+    if (object->second.move_buffers && !object->second.move_buffers->empty()) {
+        auto reservations = std::move(object->second.move_buffers);
+        object->second = StandbyObjectMetadata{};
+        object->second.move_buffers = std::move(reservations);
+        return true;
+    }
+    tenant->second.erase(object);
     if (tenant->second.empty()) {
         store_.erase(tenant);
     }
@@ -57,7 +114,9 @@ bool StandbyMetadataStore::Exists(const std::string& tenant_id,
                                   const std::string& key) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto tenant = store_.find(NormalizeTenantId(tenant_id));
-    return tenant != store_.end() && tenant->second.contains(key);
+    if (tenant == store_.end()) return false;
+    const auto entry = tenant->second.find(key);
+    return entry != tenant->second.end() && !entry->second.IsMoveBufferOnly();
 }
 
 size_t StandbyMetadataStore::GetKeyCountForTenant(
@@ -298,6 +357,18 @@ bool StandbyMetadataStore::ValidateReplicaIds(ReplicaID& max_replica_id) const {
                     return false;
                 }
                 max_replica_id = std::max(max_replica_id, replica.id);
+            }
+            if (metadata.move_buffers) {
+                for (const auto& buffer : *metadata.move_buffers) {
+                    if (buffer.replica_id == 0 ||
+                        buffer.replica_id ==
+                            std::numeric_limits<ReplicaID>::max() ||
+                        !object_ids.insert(buffer.replica_id).second) {
+                        return false;
+                    }
+                    max_replica_id =
+                        std::max(max_replica_id, buffer.replica_id);
+                }
             }
         }
     }

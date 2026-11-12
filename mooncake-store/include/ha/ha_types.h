@@ -13,6 +13,9 @@
 namespace mooncake {
 namespace ha {
 
+// Bound how long an RPC server can use a previous successful view check.
+inline constexpr std::chrono::milliseconds kReadViewCacheTtl{250};
+
 using ClusterNamespace = std::string;
 using OwnerToken = std::string;
 using OpLogSequenceId = uint64_t;

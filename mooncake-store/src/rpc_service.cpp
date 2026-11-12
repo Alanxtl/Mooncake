@@ -1406,6 +1406,21 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
         [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::FinishDrainMove(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const UUID& token, bool commit) {
+    if (token == UUID{}) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& tenant) {
+            return commit
+                       ? master_service_.MoveEnd(client_id, key, tenant, token)
+                       : master_service_.MoveRevoke(client_id, key, tenant,
+                                                    token);
+        });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     ReplicaType replica_type) {
@@ -2125,6 +2140,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::DynamicReplicaCopyRevoke,
         &WrappedMasterService::MoveStart, &WrappedMasterService::MoveEnd,
         &WrappedMasterService::MoveRevoke,
+        &WrappedMasterService::FinishDrainMove,
         &WrappedMasterService::EvictDiskReplica,
         &WrappedMasterService::EvictDiskReplicaIfCurrent,
         &WrappedMasterService::BatchEvictDiskReplica,

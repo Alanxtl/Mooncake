@@ -117,6 +117,13 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::WEIGHT_LEASE_DELETE:
             applied = ApplyWeightLeaseDelete(entry);
             break;
+        case OpType::MOVE_BUFFERS: {
+            const auto op =
+                struct_pack::deserialize<MoveBuffersOp>(entry.payload);
+            applied = op && metadata_store_->ApplyMoveBuffers(
+                                entry.tenant_id, entry.object_key, *op);
+            break;
+        }
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)

@@ -632,11 +632,13 @@ class MasterService {
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key,
-                                          const TenantId& tenant_id);
+                                          const TenantId& tenant_id,
+                                          const UUID& token = {});
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
-                                             const TenantId& tenant_id);
+                                             const TenantId& tenant_id,
+                                             const UUID& token = {});
 
     /**
      * @brief Remove an object and its replicas
@@ -1014,6 +1016,9 @@ class MasterService {
      * activated on a service whose restore did not succeed.
      */
     void ActivateServing();
+    void SetReadViewCheck(std::function<bool()> check) {
+        read_view_check_ = std::move(check);
+    }
 
     /**
      * @brief Query the status of a task
@@ -2315,6 +2320,9 @@ class MasterService {
 
     // OpLog publishing helpers
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
+    MetadataPayload BuildMetadataPayload(
+        const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas) const;
@@ -2348,6 +2356,27 @@ class MasterService {
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+
+    struct HaMoveBuffer {
+        ObjectIdentity object;
+        MoveBufferReservation reservation;
+        std::optional<Replica> replica;
+        std::chrono::steady_clock::time_point release_at;
+        bool awaiting_remount{false};
+        bool release_pending{false};
+    };
+    std::mutex ha_move_buffers_mutex_;
+    std::unordered_map<ReplicaID, HaMoveBuffer> ha_move_buffers_;
+    std::function<bool()> read_view_check_;
+    std::chrono::steady_clock::time_point ha_read_recovery_until_{};
+    void ReleaseExpiredHaMoveBuffers();
+    bool HasHaMoveBuffer(const UUID& segment_id);
+    void RetainPreparedMoveBuffers(std::vector<Replica>& replicas);
+    tl::expected<void, ErrorCode> PersistMoveBuffers(
+        const ObjectIdentity& object, const MoveBuffersOp& op);
+    std::optional<MoveBufferReservation> DescribeMoveBuffer(
+        const Replica& replica, const std::string& segment_name,
+        uint64_t hold_ms, ReplicaID copying_from = 0);
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 

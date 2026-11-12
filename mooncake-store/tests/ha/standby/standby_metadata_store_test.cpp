@@ -78,6 +78,28 @@ TEST(StandbyMetadataStoreTest, RestoreInsertRejectsDuplicateWithoutOverwrite) {
     EXPECT_EQ(1u, restored->size);
 }
 
+TEST(StandbyMetadataStoreTest, MoveReservationSurvivesOverwriteAndRemove) {
+    StandbyMetadataStore store;
+    ASSERT_TRUE(store.PutMetadata("tenant", "key", MakeMetadata(1024)));
+    MoveBufferReservation reservation{
+        7, {1, 2}, {1024, 4096, "tcp", "source"}, 1000};
+    ASSERT_TRUE(store.ApplyMoveBuffers("tenant", "key",
+                                       MoveBuffersOp{.reserve = reservation}));
+    ASSERT_TRUE(store.PutMetadata("tenant", "key", MakeMetadata(2048)));
+    ASSERT_TRUE(store.Remove("tenant", "key"));
+    EXPECT_FALSE(store.Exists("tenant", "key"));
+    EXPECT_FALSE(store.GetMetadata("tenant", "key"));
+    std::vector<StandbyObjectEntry> snapshot;
+    store.Snapshot(snapshot);
+    ASSERT_EQ(snapshot.size(), 1u);
+    ASSERT_TRUE(snapshot.front().metadata.IsMoveBufferOnly());
+    EXPECT_EQ(snapshot.front().metadata.move_buffers->front().replica_id, 7);
+    ASSERT_TRUE(
+        store.ApplyMoveBuffers("tenant", "key", MoveBuffersOp{.release = 7}));
+    store.Snapshot(snapshot);
+    EXPECT_TRUE(snapshot.empty());
+}
+
 TEST(StandbyMetadataStoreTest, WeightMetadataSnapshotRoundTripsCompleteState) {
     const WeightRevisionIdentity identity{
         .tenant_id = "default",
